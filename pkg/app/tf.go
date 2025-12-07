@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	"github.com/yu-icchi/mu/pkg/action"
@@ -148,14 +147,8 @@ func (a *App) executeTerraformPlan(
 	outputProjects := make(OutputProjects, 0, len(projects))
 	artifacts := make([]*artifact.Artifact, 0, len(projects))
 	for _, project := range projects {
-		var found bool
-		for _, file := range modifiedFiles {
-			if filepath.Dir(file) == project.Dir {
-				found = true
-				break
-			}
-		}
-		if !found {
+		// If a specific project is specified, the terraform plan may proceed regardless of the actual changes.
+		if !project.HasModifiedFiles(modifiedFiles) {
 			a.logger.Info(fmt.Sprintf("not found: project=%s", cmd.Project))
 			continue
 		}
@@ -177,6 +170,13 @@ func (a *App) executeTerraformPlan(
 			Path:      out.path,
 			Overwrite: true,
 		})
+	}
+	if len(outputProjects) == 0 {
+		const msg = "The specified project could not be found."
+		if err := a.github.CreateIssueComment(ctx, prNum, msg); err != nil {
+			return err
+		}
+		return nil
 	}
 
 	outputProjectsStr, err := json.Marshal(outputProjects)
@@ -265,21 +265,15 @@ func (a *App) executeTerraformApply(
 	outputProjects := make(OutputProjects, 0, len(projects))
 	deleteArtifactNames := make([]string, 0, len(projects))
 	for _, project := range projects {
-		var found bool
-		for _, file := range modifiedFiles {
-			if filepath.Dir(file) == project.Dir {
-				found = true
-				break
-			}
-		}
-		if !found {
+		// If a specific project is specified, the terraform apply may proceed regardless of the actual changes.
+		if !project.HasModifiedFiles(modifiedFiles) {
 			a.logger.Info("Not found", log.String("project", cmd.Project))
 			continue
 		}
 
 		artifactName := a.genArtifactName(project.Name, project.Workspace, prNum)
-		artifact := artifacts.Get(artifactName)
-		out, err := a.tfApply(ctx, prNum, sha, project, artifact, reviews)
+		artifactFile := artifacts.Get(artifactName)
+		out, err := a.tfApply(ctx, prNum, sha, project, artifactFile, reviews)
 		if err != nil {
 			return err
 		}
@@ -287,11 +281,18 @@ func (a *App) executeTerraformApply(
 			Name:      project.Name,
 			Dir:       project.Dir,
 			Workspace: project.Workspace,
-			Mode:      "plan",
+			Mode:      "apply",
 			Result:    out.result,
 			ActionURL: action.RunURL(),
 		})
 		deleteArtifactNames = append(deleteArtifactNames, artifactName)
+	}
+	if len(outputProjects) == 0 {
+		const msg = "The specified project could not be found."
+		if err := a.github.CreateIssueComment(ctx, prNum, msg); err != nil {
+			return err
+		}
+		return nil
 	}
 
 	outputProjectsStr, err := json.Marshal(outputProjects)
@@ -338,8 +339,24 @@ func (a *App) executeTerraformImport(
 		}
 		return nil
 	}
+	project := projects[0]
 
-	if err := a.tfImport(ctx, prNum, projects[0], cmd); err != nil {
+	artifactName := a.genArtifactName(project.Name, project.Workspace, prNum)
+	artifactNames := []string{artifactName}
+	artifacts, err := a.github.MultiGetArtifactsByNames(ctx, artifactNames)
+	if err != nil {
+		return err
+	}
+	if artifactFile := artifacts.Get(artifactName); artifactFile == nil {
+		return errNotFoundPlanFile
+	}
+
+	if err := a.tfImport(ctx, prNum, project, cmd); err != nil {
+		return err
+	}
+
+	// The Terraform state file may have changed, so the plan file will be deleted.
+	if err := a.github.DeleteArtifactsByNames(ctx, artifactNames); err != nil {
 		return err
 	}
 	return nil
